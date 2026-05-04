@@ -1,7 +1,7 @@
 # ualforge
 
 Parse Microsoft 365 **Unified Audit Log (UAL)** CSV exports into a single 
-SQLite database optimised for digital-forensic and **business-email-compromise
+SQLite database optimized for digital-forensic and **business-email-compromise
 (BEC)** investigations.
 
 Every row of every CSV export is preserved verbatim, the JSON `auditData`
