@@ -1,0 +1,2357 @@
+#!ADD YOUR SHEBANG HERE
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Forensic Foundry
+
+"""Parse Microsoft 365 Unified Audit Log (UAL) CSV exports into a SQLite
+database for digital-forensic / business-email-compromise investigations.
+
+Each row of every CSV export is preserved verbatim, the JSON ``auditData``
+blob is stored both raw (byte-for-byte) and in canonical form, and a wide
+set of BEC-relevant fields are promoted into indexed columns for fast
+querying.  Re-ingesting the same data is safe: full-row SHA-256 hashes are
+used as the deduplication key.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import csv
+import hashlib
+import json
+import os
+import re
+import signal
+import sqlite3
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# constants
+# ---------------------------------------------------------------------------
+
+VERSION = "2026.05.01"
+LOG_PREFIX = "ualforge"
+APP_NAME = "ualforge"
+
+# SQLite ``PRAGMA application_id`` magic: the four ASCII bytes "UALH".
+APPLICATION_ID = 0x55414C48
+
+# Schema version contract:
+#   Bumped any time the events / child-table shape or the promotion logic
+#   changes in a way that would make an old database incomplete or wrongly
+#   indexed.  bec-triage strictly enforces this number and refuses to run
+#   against a database that doesn't match.
+#
+#   v1: original wide events table; field-name promoter; no child tables.
+#   v2: full alias-chain promoter (closes the MailItemsAccessed / RecordType
+#       50 gap), normalized client_ip + lowercase user_principal_name with
+#       *_raw provenance columns, ExtendedProperties + ActorInfoString
+#       parsing, and two child tables (mail_items_accessed, consent_grants)
+#       so per-message and per-app pivots are first-class queryable.
+SCHEMA_VERSION = 2
+
+# Microsoft 365 UAL CSV header (exact match required by Plan-A discovery).
+EXPECTED_HEADER = [
+    "id",
+    "createdDateTime",
+    "auditLogRecordType",
+    "operation",
+    "organizationId",
+    "userType",
+    "userId",
+    "service",
+    "objectId",
+    "userPrincipalName",
+    "clientIp",
+    "administrativeUnits",
+    "auditData",
+]
+
+_SCRIPT_NAME = Path(sys.argv[0]).name or "script"
+
+_RUN_START = datetime.now(UTC)
+_TS_FILENAME = _RUN_START.strftime("%Y%m%d-%H%M%S")
+_TS_DATE = _RUN_START.strftime("%Y%m%d")
+_TS_DISPLAY = _RUN_START.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ---------------------------------------------------------------------------
+# color + logging scaffolding
+# ---------------------------------------------------------------------------
+
+def _color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if not sys.stdout.isatty():
+        return False
+    if sys.platform == "win32":
+        try:
+            os.system("")
+        except Exception:
+            return False
+    return True
+
+
+_USE_COLOR = _color_enabled()
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+
+
+def paint(text, *codes) -> str:
+    if not _USE_COLOR or not codes:
+        return str(text)
+    return "".join(codes) + str(text) + RESET
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class _LogWriter:
+    def __init__(self) -> None:
+        self.path: Path | None = None
+        self._fh = None
+
+    def open(self, path: Path) -> None:
+        self._fh = open(path, "w", encoding="utf-8", newline="")
+        self.path = path
+
+    def write(self, text: str) -> None:
+        if self._fh is None:
+            return
+        try:
+            self._fh.write(_ANSI_RE.sub("", text) + "\n")
+            self._fh.flush()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+
+
+_LOG = _LogWriter()
+
+
+def _emit(text: str, *, stream=None) -> None:
+    print(text, file=stream or sys.stdout, flush=True)
+    _LOG.write(text)
+
+
+def info(msg: str) -> None:
+    _emit(paint(msg, CYAN))
+
+
+def header(msg: str) -> None:
+    _emit(paint(msg, BOLD, BLUE))
+
+
+def ok(msg: str) -> None:
+    _emit(paint(msg, GREEN))
+
+
+def warn(msg: str) -> None:
+    _emit(paint(msg, YELLOW))
+
+
+def err(msg: str) -> None:
+    _emit(paint(msg, RED), stream=sys.stderr)
+
+
+def blank() -> None:
+    print(flush=True)
+    _LOG.write("")
+
+
+def dim(msg: str) -> str:
+    return paint(msg, DIM)
+
+
+_IN_FLIGHT_PARTIALS: set[Path] = set()
+
+
+def _cleanup_partials() -> None:
+    for p in list(_IN_FLIGHT_PARTIALS):
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+        _IN_FLIGHT_PARTIALS.discard(p)
+
+
+def _signal_handler(signum, _frame):
+    _cleanup_partials()
+    err(f"\n{_SCRIPT_NAME}: interrupted by signal {signum}; cleaned up partial files.")
+    sys.exit(130 if signum == signal.SIGINT else 1)
+
+
+atexit.register(_cleanup_partials)
+atexit.register(_LOG.close)
+signal.signal(signal.SIGINT, _signal_handler)
+if hasattr(signal, "SIGTERM"):
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+
+# ---------------------------------------------------------------------------
+# argparse with color
+# ---------------------------------------------------------------------------
+
+class _ColorVersionAction(argparse.Action):
+    def __init__(
+        self,
+        option_strings,
+        version=None,
+        dest=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+        help="show program's version number and exit",
+    ):
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            default=default,
+            nargs=0,
+            help=help,
+        )
+        self.version = version
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print()
+        print(f"  {paint(_SCRIPT_NAME, BOLD, CYAN)}  {paint(VERSION, BOLD, GREEN)}")
+        print()
+        parser.exit()
+
+
+def _colorize_help(text: str) -> str:
+    if not _USE_COLOR:
+        return text
+    text = re.sub(r"(?m)^(usage:)", f"{BOLD}{MAGENTA}\\1{RESET}", text)
+    text = re.sub(
+        r"(?m)^(positional arguments|options|examples|notes):",
+        f"{BOLD}{CYAN}\\1{RESET}:",
+        text,
+    )
+    text = re.sub(
+        r"(?<![\w-])(--?[A-Za-z][\w-]*)",
+        f"{GREEN}\\1{RESET}",
+        text,
+    )
+    text = re.sub(
+        r"\b([A-Z][A-Z0-9_]{1,})\b",
+        f"{CYAN}\\1{RESET}",
+        text,
+    )
+    return text
+
+
+class _ColorParser(argparse.ArgumentParser):
+    def format_help(self) -> str:
+        return "\n" + _colorize_help(super().format_help())
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = _ColorParser(
+        prog=_SCRIPT_NAME,
+        description=(
+            "Parse Microsoft 365 Unified Audit Log CSVs into a SQLite "
+            "database for DFIR / BEC investigations."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            f"  {_SCRIPT_NAME} -o ./out ./ualevidence\n"
+            f"  {_SCRIPT_NAME} -a ./out/ualforge-20260427.sqlite -l ./more-ualevidence\n"
+        ),
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action=_ColorVersionAction,
+        version=f"{_SCRIPT_NAME} {VERSION}",
+    )
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument(
+        "-o", "--output",
+        metavar="DIR",
+        help=(
+            "output directory; database is written to "
+            "<DIR>/ualforge-yyyymmdd.sqlite. If that file already "
+            "exists it must be a ualforge database and is appended to."
+        ),
+    )
+    target.add_argument(
+        "-a", "--append",
+        metavar="DB",
+        help=(
+            "append to an existing ualforge SQLite database "
+            "(must already exist and pass schema verification)."
+        ),
+    )
+    target.add_argument(
+        "--reextract",
+        metavar="DB",
+        help=(
+            "re-run the auditData -> promoted-columns + child-tables "
+            "extraction in place, against the canonical JSON already "
+            "stored in the database; no source CSV is re-read.  Use this "
+            "to upgrade a v1 database to v2, or to refresh promoted "
+            "values after a future promoter improvement.  No INPUT_DIR."
+        ),
+    )
+    parser.add_argument(
+        "-l", "--log",
+        action="store_true",
+        help=f"write a {LOG_PREFIX}-yyyymmdd-hhmmss.log next to the database",
+    )
+    parser.add_argument(
+        "input_dir",
+        metavar="INPUT_DIR",
+        nargs="?",
+        help=(
+            "directory to recursively scan for UAL CSV files "
+            "(required for -o / -a; ignored for --reextract)"
+        ),
+    )
+    return parser
+
+
+def _resolve_log_path(out_dir: Path) -> Path:
+    target = out_dir / f"{LOG_PREFIX}-{_TS_FILENAME}.log"
+    if not target.exists():
+        return target
+    counter = 1
+    while True:
+        candidate = out_dir / f"{LOG_PREFIX}-{_TS_FILENAME}-{counter}.log"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def _format_duration(td) -> str:
+    total = int(td.total_seconds())
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+
+
+# ---------------------------------------------------------------------------
+# database schema
+# ---------------------------------------------------------------------------
+
+_SCHEMA_DDL: list[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS ualforge_meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_runs (
+        run_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at            TEXT NOT NULL,
+        ended_at              TEXT,
+        app_version           TEXT NOT NULL,
+        argv                  TEXT,
+        input_dir             TEXT,
+        mode                  TEXT,
+        files_processed       INTEGER DEFAULT 0,
+        rows_seen             INTEGER DEFAULT 0,
+        rows_inserted         INTEGER DEFAULT 0,
+        rows_duplicate        INTEGER DEFAULT 0,
+        rows_with_errors      INTEGER DEFAULT 0,
+        mia_rows_emitted      INTEGER DEFAULT 0,
+        consent_rows_emitted  INTEGER DEFAULT 0,
+        coverage_json         TEXT,
+        status                TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingest_files (
+        file_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id            INTEGER NOT NULL REFERENCES ingest_runs(run_id),
+        source_file       TEXT NOT NULL,
+        export_batch      TEXT,
+        sha256            TEXT,
+        size_bytes        INTEGER,
+        mtime_utc         TEXT,
+        rows_seen         INTEGER DEFAULT 0,
+        rows_inserted     INTEGER DEFAULT 0,
+        rows_duplicate    INTEGER DEFAULT 0,
+        rows_with_errors  INTEGER DEFAULT 0,
+        status            TEXT,
+        error_message     TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS parse_errors (
+        error_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id          INTEGER REFERENCES ingest_runs(run_id),
+        source_file     TEXT,
+        source_line     INTEGER,
+        field           TEXT,
+        error_type      TEXT,
+        error_message   TEXT,
+        raw_excerpt     TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS events (
+        row_hash                  TEXT PRIMARY KEY,
+        source_file               TEXT NOT NULL,
+        source_line               INTEGER,
+        export_batch              TEXT,
+        ingested_at               TEXT NOT NULL,
+        ingest_run_id             INTEGER REFERENCES ingest_runs(run_id),
+        parse_error               TEXT,
+
+        id                        TEXT,
+        created_at_raw            TEXT,
+        created_at_utc            TEXT,
+        audit_log_record_type     TEXT,
+        operation                 TEXT,
+        organization_id           TEXT,
+        user_type                 TEXT,
+        user_id                   TEXT,
+        service                   TEXT,
+        object_id                 TEXT,
+        user_principal_name       TEXT,        -- normalized: lowercased
+        user_principal_name_raw   TEXT,        -- v2: original casing as Microsoft wrote it
+        client_ip_csv             TEXT,
+        administrative_units      TEXT,
+
+        audit_data_raw            TEXT,
+        audit_data_canonical      TEXT,
+
+        workload                  TEXT,
+        client_ip                 TEXT,        -- normalized: port + IPv6-brackets stripped
+        client_ip_raw             TEXT,        -- v2: original 'ClientIP' value verbatim
+        user_agent                TEXT,
+        geo_location              TEXT,
+        event_source              TEXT,
+        result_status             TEXT,
+        result_status_detail      TEXT,        -- v2: granular reason (e.g. STS logon error code)
+        correlation_id            TEXT,
+        application_id            TEXT,
+        user_key                  TEXT,
+        record_type_int           INTEGER,
+
+        mailbox_owner_upn         TEXT,
+        mailbox_guid              TEXT,
+        logon_type                TEXT,
+        client_info_string        TEXT,
+        internet_message_id       TEXT,
+        item_subject              TEXT,
+        item_parent_folder_path   TEXT,
+
+        session_id                TEXT,
+        logon_user_sid            TEXT,
+        authentication_type       TEXT,        -- v2: now also fed by ExtendedProperties.RequestType
+        request_type              TEXT,        -- v2: STS-logon RequestType (e.g. 'OAuth2:Authorize')
+        user_authentication_method TEXT,       -- v2: STS-logon UserAuthenticationMethod (MFA factor)
+        device_properties         TEXT,
+        extended_properties       TEXT,        -- v2: canonical JSON of ExtendedProperties array
+        actor_ip_address          TEXT,
+
+        modified_properties       TEXT,
+        parameters                TEXT,
+        operation_properties      TEXT,
+
+        actor_upn                 TEXT,
+        target_upn                TEXT,
+
+        site                      TEXT,
+        web_id                    TEXT,
+        list_id                   TEXT,
+        list_item_unique_id       TEXT,
+        source_file_name          TEXT,
+        source_relative_url       TEXT,
+        item_type                 TEXT,
+
+        client_app_id             TEXT,
+        client_app_name           TEXT,
+        browser_name              TEXT,
+        browser_version           TEXT,
+        platform                  TEXT,
+        is_managed_device         INTEGER,
+        device_display_name       TEXT,
+
+        mail_item_count           INTEGER      -- v2: from auditData.OperationCount (RecordType 50)
+    )
+    """,
+    """
+    -- v2: per-message expansion of MailItemsAccessed (RecordType 50) events.
+    -- One audit row aggregates many messages in Folders[].FolderItems[]; this
+    -- table makes each accessed message individually queryable so analysts can
+    -- ask "which specific InternetMessageIds did the actor read".
+    CREATE TABLE IF NOT EXISTS mail_items_accessed (
+        mia_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_row_hash        TEXT NOT NULL REFERENCES events(row_hash) ON DELETE CASCADE,
+        event_id              TEXT,
+        ingest_run_id         INTEGER REFERENCES ingest_runs(run_id),
+
+        -- denormalized from parent event for fast filtering / grouping
+        user_principal_name   TEXT,
+        client_ip             TEXT,
+        created_at_utc        TEXT,
+        operation             TEXT,
+        mailbox_owner_upn     TEXT,
+
+        -- per-item fields from Folders[].FolderItems[]
+        folder_id             TEXT,
+        folder_path           TEXT,
+        item_internal_id      TEXT,
+        internet_message_id   TEXT,
+        subject               TEXT,
+        size_in_bytes         INTEGER,
+        client_request_id     TEXT,
+        immutable_id          TEXT
+    )
+    """,
+    """
+    -- v2: structured view of OAuth consent / service-principal grant events.
+    -- Replaces bec-triage's inline JSON parsing of auditData.Target with one
+    -- row per (event, target app) and explicit columns for permission scope
+    -- and consent type.
+    CREATE TABLE IF NOT EXISTS consent_grants (
+        cg_id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_row_hash        TEXT NOT NULL REFERENCES events(row_hash) ON DELETE CASCADE,
+        event_id              TEXT,
+        ingest_run_id         INTEGER REFERENCES ingest_runs(run_id),
+
+        -- denormalized from parent event
+        user_principal_name   TEXT,
+        client_ip             TEXT,
+        created_at_utc        TEXT,
+        operation             TEXT,
+
+        -- target app being granted access
+        app_id                TEXT,
+        app_display_name      TEXT,
+
+        -- consent details
+        consent_type          TEXT,          -- 'Principal' / 'AllPrincipals' / 'AdminConsent'
+        is_admin_consent      INTEGER,       -- 0/1, NULL when unknown
+        permission_scope      TEXT,          -- '; '-joined permission strings
+        granted_to_id         TEXT,          -- recipient UPN / SP-id of the grant
+        granted_to_name       TEXT
+    )
+    """,
+]
+
+_INDEX_DDL: list[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_events_id           ON events(id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_created      ON events(created_at_utc)",
+    "CREATE INDEX IF NOT EXISTS idx_events_upn          ON events(user_principal_name)",
+    "CREATE INDEX IF NOT EXISTS idx_events_user_id      ON events(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_operation    ON events(operation)",
+    "CREATE INDEX IF NOT EXISTS idx_events_record_type  ON events(audit_log_record_type)",
+    "CREATE INDEX IF NOT EXISTS idx_events_record_int   ON events(record_type_int)",
+    "CREATE INDEX IF NOT EXISTS idx_events_service      ON events(service)",
+    "CREATE INDEX IF NOT EXISTS idx_events_client_ip    ON events(client_ip)",
+    "CREATE INDEX IF NOT EXISTS idx_events_correlation  ON events(correlation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_imid         ON events(internet_message_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_mailbox_upn  ON events(mailbox_owner_upn)",
+    "CREATE INDEX IF NOT EXISTS idx_events_session      ON events(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_app_id       ON events(application_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_actor_upn    ON events(actor_upn)",
+    "CREATE INDEX IF NOT EXISTS idx_events_target_upn   ON events(target_upn)",
+    "CREATE INDEX IF NOT EXISTS idx_events_export_batch ON events(export_batch)",
+    "CREATE INDEX IF NOT EXISTS idx_events_source_file  ON events(source_file)",
+    "CREATE INDEX IF NOT EXISTS idx_events_upn_created  ON events(user_principal_name, created_at_utc)",
+    "CREATE INDEX IF NOT EXISTS idx_events_upn_op       ON events(user_principal_name, operation)",
+    "CREATE INDEX IF NOT EXISTS idx_files_run           ON ingest_files(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_errors_run          ON parse_errors(run_id)",
+    # v2 child-table indexes
+    "CREATE INDEX IF NOT EXISTS idx_mia_event_row       ON mail_items_accessed(event_row_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_mia_upn             ON mail_items_accessed(user_principal_name)",
+    "CREATE INDEX IF NOT EXISTS idx_mia_imid            ON mail_items_accessed(internet_message_id)",
+    "CREATE INDEX IF NOT EXISTS idx_mia_subj            ON mail_items_accessed(subject)",
+    "CREATE INDEX IF NOT EXISTS idx_mia_created         ON mail_items_accessed(created_at_utc)",
+    # Dedup key: SQLite UNIQUE treats NULL as distinct, but every per-item
+    # field Microsoft emits (Id, InternetMessageId) is sometimes absent --
+    # so we wrap each component in COALESCE to a sentinel.  This makes
+    # INSERT OR IGNORE actually idempotent across re-ingests of the same
+    # CSV (a real-world scenario when M365's paged exports overlap).
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_mia_event_item ON mail_items_accessed("
+    "  event_row_hash, "
+    "  COALESCE(folder_id, ''), "
+    "  COALESCE(item_internal_id, internet_message_id, '')"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_cg_event_row        ON consent_grants(event_row_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_cg_upn              ON consent_grants(user_principal_name)",
+    "CREATE INDEX IF NOT EXISTS idx_cg_app              ON consent_grants(app_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cg_created          ON consent_grants(created_at_utc)",
+    # Same NULL-safe dedup key for consent grants.  app_id can be NULL when
+    # only an app display name is present (rare but observed).
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_cg_event_app ON consent_grants("
+    "  event_row_hash, "
+    "  COALESCE(app_id, app_display_name, '')"
+    ")",
+]
+
+_EVENT_COLUMNS: list[str] = [
+    "row_hash", "source_file", "source_line", "export_batch",
+    "ingested_at", "ingest_run_id", "parse_error",
+    "id", "created_at_raw", "created_at_utc", "audit_log_record_type",
+    "operation", "organization_id", "user_type", "user_id", "service",
+    "object_id", "user_principal_name", "user_principal_name_raw",
+    "client_ip_csv", "administrative_units",
+    "audit_data_raw", "audit_data_canonical",
+    "workload", "client_ip", "client_ip_raw", "user_agent",
+    "geo_location", "event_source",
+    "result_status", "result_status_detail",
+    "correlation_id", "application_id", "user_key",
+    "record_type_int",
+    "mailbox_owner_upn", "mailbox_guid", "logon_type", "client_info_string",
+    "internet_message_id", "item_subject", "item_parent_folder_path",
+    "session_id", "logon_user_sid",
+    "authentication_type", "request_type", "user_authentication_method",
+    "device_properties", "extended_properties",
+    "actor_ip_address",
+    "modified_properties", "parameters", "operation_properties",
+    "actor_upn", "target_upn",
+    "site", "web_id", "list_id", "list_item_unique_id",
+    "source_file_name", "source_relative_url", "item_type",
+    "client_app_id", "client_app_name", "browser_name", "browser_version",
+    "platform", "is_managed_device", "device_display_name",
+    "mail_item_count",
+]
+
+_INSERT_SQL = (
+    f"INSERT OR IGNORE INTO events ({', '.join(_EVENT_COLUMNS)}) "
+    f"VALUES ({', '.join('?' for _ in _EVENT_COLUMNS)})"
+)
+
+_MIA_COLUMNS: list[str] = [
+    "event_row_hash", "event_id", "ingest_run_id",
+    "user_principal_name", "client_ip", "created_at_utc", "operation",
+    "mailbox_owner_upn",
+    "folder_id", "folder_path", "item_internal_id", "internet_message_id",
+    "subject", "size_in_bytes", "client_request_id", "immutable_id",
+]
+
+_MIA_INSERT_SQL = (
+    f"INSERT OR IGNORE INTO mail_items_accessed ({', '.join(_MIA_COLUMNS)}) "
+    f"VALUES ({', '.join('?' for _ in _MIA_COLUMNS)})"
+)
+
+_CG_COLUMNS: list[str] = [
+    "event_row_hash", "event_id", "ingest_run_id",
+    "user_principal_name", "client_ip", "created_at_utc", "operation",
+    "app_id", "app_display_name",
+    "consent_type", "is_admin_consent", "permission_scope",
+    "granted_to_id", "granted_to_name",
+]
+
+_CG_INSERT_SQL = (
+    f"INSERT OR IGNORE INTO consent_grants ({', '.join(_CG_COLUMNS)}) "
+    f"VALUES ({', '.join('?' for _ in _CG_COLUMNS)})"
+)
+
+
+# ---------------------------------------------------------------------------
+# database open / verify
+# ---------------------------------------------------------------------------
+
+def open_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -65536")  # ~64 MiB page cache
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    for ddl in _SCHEMA_DDL:
+        conn.execute(ddl)
+    for ddl in _INDEX_DDL:
+        conn.execute(ddl)
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    conn.executemany(
+        "INSERT OR IGNORE INTO ualforge_meta(key, value) VALUES(?, ?)",
+        [
+            ("app", APP_NAME),
+            ("schema_version", str(SCHEMA_VERSION)),
+            ("created_at", now),
+            ("created_by_version", VERSION),
+        ],
+    )
+    conn.executemany(
+        "INSERT OR REPLACE INTO ualforge_meta(key, value) VALUES(?, ?)",
+        [
+            ("last_opened_at", now),
+            ("last_opened_by_version", VERSION),
+        ],
+    )
+    conn.commit()
+
+
+def verify_ualforge_db(path: Path) -> tuple[bool, str]:
+    """Return ``(ok, reason)``.  Conservative: every check must pass."""
+    if not path.exists():
+        return False, f"file does not exist: {path}"
+    if not path.is_file():
+        return False, f"path is not a file: {path}"
+    try:
+        conn = sqlite3.connect(path)
+    except sqlite3.Error as e:
+        return False, f"could not open as SQLite: {e}"
+    try:
+        app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+        if app_id != APPLICATION_ID:
+            return False, (
+                f"PRAGMA application_id is {app_id:#010x}, expected "
+                f"{APPLICATION_ID:#010x} ('UALH')"
+            )
+        ver = conn.execute("PRAGMA user_version").fetchone()[0]
+        row = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='ualforge_meta'"
+        ).fetchone()
+        if row is None:
+            return False, "missing ualforge_meta table"
+        row = conn.execute(
+            "SELECT value FROM ualforge_meta WHERE key='app'"
+        ).fetchone()
+        if row is None or row[0] != APP_NAME:
+            return False, "ualforge_meta.app is not 'ualforge'"
+        if ver != SCHEMA_VERSION:
+            return False, (
+                f"schema_version mismatch: db user_version={ver}, "
+                f"this {APP_NAME} expects {SCHEMA_VERSION}.  "
+                f"Re-ingest from the source CSVs, or run "
+                f"`{_SCRIPT_NAME} --reextract <DB>` to upgrade the promoted "
+                f"columns and rebuild child tables in place from the "
+                f"preserved auditData JSON."
+            )
+        return True, "ok"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CSV discovery
+# ---------------------------------------------------------------------------
+
+_PRIMARY_NAME_RE = re.compile(r"UnifiedAuditLog.*part\d+\.csv$", re.IGNORECASE)
+
+
+def _is_valid_ual_csv(path: Path) -> tuple[bool, str]:
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            try:
+                hdr = next(reader)
+            except StopIteration:
+                return False, "empty file"
+        if [c.strip() for c in hdr] != EXPECTED_HEADER:
+            return False, "header does not match the UAL schema exactly"
+        return True, "ok"
+    except OSError as e:
+        return False, f"read error: {e}"
+    except UnicodeDecodeError as e:
+        return False, f"not UTF-8 text: {e}"
+
+
+def find_ual_csvs(input_dir: Path) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Discover UAL CSVs.
+
+    Plan A: any ``*UnifiedAuditLog*part<N>.csv`` under ``input_dir``.
+    Plan B (only if A finds nothing): every ``*.csv`` under ``input_dir``,
+    each individually validated against ``EXPECTED_HEADER``.
+    """
+    rejected: list[tuple[Path, str]] = []
+
+    plan_a = sorted(
+        p for p in input_dir.rglob("*.csv")
+        if _PRIMARY_NAME_RE.search(p.name)
+    )
+    if plan_a:
+        accepted: list[Path] = []
+        for p in plan_a:
+            ok_v, reason = _is_valid_ual_csv(p)
+            if ok_v:
+                accepted.append(p)
+            else:
+                rejected.append((p, reason))
+        return accepted, rejected
+
+    info("No primary-pattern UAL files found; falling back to structural scan of all .csv files.")
+    accepted = []
+    for p in sorted(input_dir.rglob("*.csv")):
+        ok_v, reason = _is_valid_ual_csv(p)
+        if ok_v:
+            accepted.append(p)
+        else:
+            rejected.append((p, reason))
+    return accepted, rejected
+
+
+# ---------------------------------------------------------------------------
+# parsers
+# ---------------------------------------------------------------------------
+
+# Microsoft delivers ``createdDateTime`` in US locale ``M/D/YYYY h:mm:ss AM/PM``
+# wall-clock time that matches ``auditData.CreationTime`` (which is ISO-8601
+# UTC with a trailing 'Z'); we treat the CSV value as UTC when the JSON value
+# is missing.
+_DT_FORMATS = (
+    "%m/%d/%Y %I:%M:%S %p",
+    "%m/%d/%Y %I:%M %p",
+    "%m/%d/%Y %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S.%fZ",
+    "%Y-%m-%dT%H:%M:%S",
+)
+
+
+def parse_created_dt(raw: str) -> str | None:
+    if not raw:
+        return None
+    s = raw.strip()
+    for fmt in _DT_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            else:
+                dt = dt.astimezone(UTC)
+            return dt.isoformat(timespec="seconds")
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    else:
+        dt = dt.astimezone(UTC)
+    return dt.isoformat(timespec="seconds")
+
+
+def canonical_json(obj) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _first_upn_id(arr) -> str | None:
+    """For Azure-AD ``Actor`` / ``Target`` arrays, return the first ``ID``
+    that looks like a UPN (contains '@'); else the first ``ID``."""
+    if not isinstance(arr, list):
+        return None
+    first = None
+    for item in arr:
+        if not isinstance(item, dict):
+            continue
+        ident = item.get("ID")
+        if not ident:
+            continue
+        if first is None:
+            first = ident
+        if isinstance(ident, str) and "@" in ident:
+            return ident
+    return first
+
+
+def _maybe_json(obj) -> str | None:
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (int, float, bool)):
+        return str(obj)
+    return canonical_json(obj)
+
+
+def _first_present(audit: dict, *names: str):
+    """Return the first non-empty value from a chain of alternative key names.
+
+    Microsoft uses different field names for the same logical concept across
+    UAL ``RecordType`` schemas (``ClientIP`` vs ``ClientIPAddress`` vs
+    ``IPAddress``, ``ApplicationId`` vs ``AppId`` vs ``ClientAppId``, etc.).
+    This collapses every alias chain into a single helper so the promoter can
+    declare "I want the source IP, here are the field names Microsoft has
+    historically used for it" rather than scattering ``or`` chains.
+
+    Empty strings are treated as missing -- some Microsoft sub-schemas emit
+    ``""`` rather than omitting the field.
+    """
+    for n in names:
+        v = audit.get(n)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def _ext_prop(extended, name: str) -> str | None:
+    """Look up ``Value`` for the named entry in an ``ExtendedProperties`` array.
+
+    Microsoft serialises a number of high-value attributes (``UserAgent``,
+    ``RequestType``, ``UserAuthenticationMethod``, ``ResultStatusDetail``)
+    inside an array of ``{Name, Value}`` dicts rather than as top-level keys.
+    """
+    if not isinstance(extended, list):
+        return None
+    for entry in extended:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("Name") == name:
+            v = entry.get("Value")
+            if v not in (None, ""):
+                return str(v)
+    return None
+
+
+def _ua_from_extended_properties(extended) -> str | None:
+    return _ext_prop(extended, "UserAgent")
+
+
+_ACTOR_INFO_UA_RE = re.compile(r"UserAgent=([^;]+)")
+
+
+def _ua_from_actor_info_string(s) -> str | None:
+    """Pull ``UserAgent=...`` out of the ``ActorInfoString`` semicolon-list.
+
+    For ``MailItemsAccessed`` (RecordType 50) and other REST/Graph events
+    Microsoft puts the user-agent inside ``ActorInfoString`` like::
+
+        Client=REST;Client=RESTSystem;UserAgent=[NoUserAgent][AppId=...];
+
+    The literal ``[NoUserAgent]`` value is preserved verbatim; it is itself
+    a forensically meaningful signal (= app-only / token-based caller).
+    """
+    if not isinstance(s, str) or not s:
+        return None
+    m = _ACTOR_INFO_UA_RE.search(s)
+    return m.group(1).strip() if m else None
+
+
+_IPV4_PORT_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):\d+$")
+_IPV6_BRACKET_PORT_RE = re.compile(r"^\[([^\]]+)\]:\d+$")
+_IPV6_BRACKET_RE = re.compile(r"^\[([^\]]+)\]$")
+
+
+def _normalize_ip(value) -> str | None:
+    """Strip ephemeral port and IPv6 brackets from a ClientIP value.
+
+    The TCP source port is picked by the actor's OS for every new session,
+    so it has no forensic value; including it splits one identity into
+    many under naive ``GROUP BY``.  Brackets only matter when a port is
+    present, so they are stripped for cleanliness.
+    """
+    if value is None:
+        return None
+    s = str(value)
+    if not s:
+        return None
+    if (m := _IPV4_PORT_RE.match(s)):
+        return m.group(1)
+    if (m := _IPV6_BRACKET_PORT_RE.match(s)):
+        return m.group(1)
+    if (m := _IPV6_BRACKET_RE.match(s)):
+        return m.group(1)
+    return s
+
+
+def _normalize_upn(value) -> str | None:
+    """Lowercase a user_principal_name; preserve None / empty as-is.
+
+    UAL inconsistently emits the same identity with multiple casings
+    (``User.Name@x.com`` and ``user.name@x.com``); normalising at ingest
+    means every downstream query can do plain ``= ?`` instead of
+    ``LOWER(user_principal_name) = ?``.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return s.lower()
+
+
+# ---------------------------------------------------------------------------
+# RecordType-aware promotion
+# ---------------------------------------------------------------------------
+#
+# Microsoft's UAL schema is a union of dozens of per-product schemas tagged
+# by ``RecordType``.  The fields we care about live under different names
+# in each.  ``extract_promoted`` builds a "best-effort default" view using
+# alias chains, then a small per-RecordType specializer fills in or
+# overrides values that only that schema knows about.
+#
+# Reference: https://learn.microsoft.com/en-us/office/office-365-management-api/
+#            office-365-management-activity-api-schema
+# ---------------------------------------------------------------------------
+
+# Aliases for the source IP across Exchange / SharePoint / AAD / Graph schemas.
+_IP_ALIASES = ("ClientIP", "ClientIp", "ClientIPAddress",
+               "IPAddress", "IpAddress", "ActorIpAddress")
+
+# Aliases for "the application that performed this action".
+_APP_ID_ALIASES = ("ApplicationId", "AppId", "ClientAppId")
+
+
+def extract_promoted(audit: dict, csv_client_ip: str | None) -> dict:
+    """Pull BEC-relevant scalar fields out of the auditData JSON.
+
+    This is the v2 promoter: full alias chains for fields Microsoft renames
+    across RecordTypes, ``ExtendedProperties`` walked for AAD-style sub-keys,
+    ``ActorInfoString`` parsed for the embedded UserAgent, and a per-RecordType
+    specializer that fills schema-specific gaps (notably MailItemsAccessed).
+
+    All IP and UPN values are normalized; provenance copies of the original
+    strings are returned in ``client_ip_raw`` and ``user_principal_name_raw``
+    so the analyst never loses Microsoft's verbatim record.
+    """
+    g = audit.get
+    item = g("Item") if isinstance(g("Item"), dict) else {}
+    parent = item.get("ParentFolder") if isinstance(item.get("ParentFolder"), dict) else {}
+    is_managed = g("IsManagedDevice")
+    record_type = g("RecordType")
+    extended = g("ExtendedProperties")
+
+    raw_ip = _first_present(audit, *_IP_ALIASES)
+    if raw_ip in (None, "") and csv_client_ip:
+        raw_ip = csv_client_ip
+    norm_ip = _normalize_ip(raw_ip)
+
+    user_agent = (
+        _first_present(audit, "UserAgent")
+        or _ua_from_extended_properties(extended)
+        or _ua_from_actor_info_string(g("ActorInfoString"))
+    )
+
+    promoted = {
+        "workload":            g("Workload"),
+        "client_ip":           norm_ip,
+        "client_ip_raw":       raw_ip if raw_ip not in (None, "") else None,
+        "user_agent":          user_agent,
+        "geo_location":        g("GeoLocation"),
+        "event_source":        g("EventSource"),
+        "result_status":       g("ResultStatus"),
+        "result_status_detail": (
+            g("ResultStatusDetail") or _ext_prop(extended, "ResultStatusDetail")
+        ),
+        "correlation_id":      g("CorrelationId"),
+        "application_id":      _first_present(audit, *_APP_ID_ALIASES),
+        "user_key":            g("UserKey"),
+        "record_type_int":     record_type if isinstance(record_type, int) else None,
+        "mailbox_owner_upn":   _normalize_upn(g("MailboxOwnerUPN")),
+        "mailbox_guid":        g("MailboxGuid"),
+        "logon_type":          str(g("LogonType")) if g("LogonType") is not None else None,
+        "client_info_string":  g("ClientInfoString"),
+        "internet_message_id": item.get("InternetMessageId") or g("InternetMessageId"),
+        "item_subject":        item.get("Subject"),
+        "item_parent_folder_path": parent.get("Path"),
+        "session_id":          g("SessionId"),
+        "logon_user_sid":      g("LogonUserSid"),
+        "authentication_type": (
+            g("AuthenticationType") or _ext_prop(extended, "RequestType")
+        ),
+        "request_type":        _ext_prop(extended, "RequestType"),
+        "user_authentication_method": _ext_prop(extended, "UserAuthenticationMethod"),
+        "device_properties":   _maybe_json(g("DeviceProperties")),
+        "extended_properties": _maybe_json(extended) if extended else None,
+        "actor_ip_address":    g("ActorIpAddress"),
+        "modified_properties": _maybe_json(g("ModifiedProperties")),
+        "parameters":          _maybe_json(g("Parameters")),
+        "operation_properties": _maybe_json(g("OperationProperties")),
+        "actor_upn":           _normalize_upn(_first_upn_id(g("Actor"))),
+        "target_upn":          _normalize_upn(_first_upn_id(g("Target"))),
+        "site":                g("Site") or g("SiteUrl"),
+        "web_id":              g("WebId"),
+        "list_id":             g("ListId"),
+        "list_item_unique_id": g("ListItemUniqueId"),
+        "source_file_name":    g("SourceFileName"),
+        "source_relative_url": g("SourceRelativeUrl"),
+        "item_type":           g("ItemType"),
+        # client_app_id is now the alias for the *initiating* app id, which
+        # for nearly every event is the same as application_id; we keep it
+        # populated as a deprecated convenience for now.
+        "client_app_id":       _first_present(audit, "AppId", "ClientAppId"),
+        "client_app_name":     g("ClientAppName") or g("ApplicationDisplayName"),
+        "browser_name":        g("BrowserName"),
+        "browser_version":     g("BrowserVersion"),
+        "platform":            g("Platform"),
+        "is_managed_device":   (1 if is_managed else 0) if isinstance(is_managed, bool) else None,
+        "device_display_name": g("DeviceDisplayName"),
+        "mail_item_count":     None,
+    }
+
+    specialiser = _SPECIALIZERS.get(promoted["record_type_int"])
+    if specialiser is not None:
+        specialiser(audit, promoted)
+
+    return promoted
+
+
+def _spec_aad_sts_logon(audit: dict, promoted: dict) -> None:
+    """RecordType 8: AzureActiveDirectoryStsLogon (interactive sign-in).
+
+    AAD STS-logon events store the source IP as ``IPAddress`` (no Client
+    prefix), put the user-agent inside ``ExtendedProperties``, and routinely
+    emit ``LogonError`` (e.g. ``InvalidUserNameOrPassword``,
+    ``UserStrongAuthClientAuthNRequired``) which is the granular failure
+    reason.  ``_first_present`` already covered ``IPAddress``; the only thing
+    this specialiser needs to do is surface ``LogonError`` into the
+    ``result_status_detail`` column when it's the most informative value.
+    """
+    if not promoted.get("result_status_detail"):
+        promoted["result_status_detail"] = audit.get("LogonError")
+
+
+def _spec_aad_consent(audit: dict, promoted: dict) -> None:
+    """RecordType 15: AzureActiveDirectory (consent / app-role / SP events).
+
+    No scalar fix-ups beyond the defaults; the rich detail lives in
+    ``Target`` / ``ModifiedProperties`` and is structured into the
+    ``consent_grants`` child table by ``extract_consent_grants``.
+    """
+    return None
+
+
+def _spec_exchange_item_aggregated(audit: dict, promoted: dict) -> None:
+    """RecordType 50: ExchangeItemAggregated -- ``MailItemsAccessed``.
+
+    These events aggregate up to N mail-item accesses into one audit row.
+    The default promoter handles ``ClientIPAddress`` and ``AppId`` via
+    aliases; this specialiser surfaces the per-event item count from
+    ``OperationCount`` so analysts can tell at a glance whether a row covers
+    1 read or 50.  Per-message detail is structured into
+    ``mail_items_accessed`` by ``extract_mia_rows``.
+    """
+    oc = audit.get("OperationCount")
+    if isinstance(oc, int):
+        promoted["mail_item_count"] = oc
+    elif isinstance(oc, str) and oc.isdigit():
+        promoted["mail_item_count"] = int(oc)
+
+
+_SPECIALIZERS = {
+    8:  _spec_aad_sts_logon,
+    15: _spec_aad_consent,
+    50: _spec_exchange_item_aggregated,
+}
+
+
+# ---------------------------------------------------------------------------
+# Child-table emitters
+# ---------------------------------------------------------------------------
+
+def extract_mia_rows(
+    audit: dict,
+    *,
+    event_row_hash: str,
+    event_id: str | None,
+    ingest_run_id: int,
+    user_principal_name: str | None,
+    client_ip: str | None,
+    created_at_utc: str | None,
+    operation: str | None,
+    mailbox_owner_upn: str | None,
+) -> list[tuple]:
+    """One row per accessed mail item from ``Folders[].FolderItems[]``.
+
+    Returns an empty list for non-MailItemsAccessed events or when the
+    Folders array is absent / empty / malformed -- the caller never needs
+    to special-case the result.
+    """
+    rt = audit.get("RecordType")
+    if rt != 50:
+        return []
+    folders = audit.get("Folders")
+    if not isinstance(folders, list):
+        return []
+    out: list[tuple] = []
+    for folder in folders:
+        if not isinstance(folder, dict):
+            continue
+        folder_id = folder.get("Id")
+        folder_path = folder.get("Path")
+        items = folder.get("FolderItems")
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            size = it.get("SizeInBytes")
+            if isinstance(size, str) and size.isdigit():
+                size = int(size)
+            elif not isinstance(size, int):
+                size = None
+            out.append((
+                event_row_hash, event_id, ingest_run_id,
+                user_principal_name, client_ip, created_at_utc, operation,
+                mailbox_owner_upn,
+                folder_id, folder_path,
+                it.get("Id"), it.get("InternetMessageId"),
+                it.get("Subject"), size,
+                it.get("ClientRequestId"), it.get("ImmutableId"),
+            ))
+    return out
+
+
+# Operations that produce a consent / service-principal grant the analyst
+# wants pivoted in the consent_grants child table.  This list is the union of
+# every consent-shaped operation Microsoft has emitted across RecordTypes 8
+# and 15 over the years (note the trailing periods -- Microsoft includes them).
+_CONSENT_OPERATIONS: frozenset[str] = frozenset({
+    "Consent to application.",
+    "Add OAuth2PermissionGrant.",
+    "Add delegated permission grant.",
+    "Add app role assignment grant to user.",
+    "Add app role assignment to service principal.",
+    "Add service principal.",
+    "Add service principal credentials.",
+    "Update application - Certificates and secrets management",
+    "Update application \u2013 Certificates and secrets management",
+})
+
+
+def _parse_target_app(target) -> tuple[str | None, str | None]:
+    """Pull ``(app_id, app_display_name)`` out of an auditData ``Target`` array."""
+    if not isinstance(target, list):
+        return None, None
+    app_id = None
+    app_name = None
+    for entry in target:
+        if not isinstance(entry, dict):
+            continue
+        ident = entry.get("ID") or entry.get("Id")
+        if not isinstance(ident, str):
+            continue
+        if "@" in ident:
+            continue  # that's a UPN; skip
+        # Heuristic: bare GUID = app id; everything else = display name.
+        if re.fullmatch(r"[0-9a-fA-F-]{30,}", ident):
+            if app_id is None:
+                app_id = ident
+        elif app_name is None:
+            app_name = ident
+    return app_id, app_name
+
+
+def _parse_modified_properties(modprops) -> dict[str, str | None]:
+    """Walk a ``ModifiedProperties`` array, indexing by ``Name``.
+
+    Returns the canonical view of consent-shaped sub-fields (permissions,
+    consent type, etc.) using both ``NewValue`` and ``OldValue`` so a
+    consent-revocation also has its scope captured.
+    """
+    out: dict[str, str | None] = {}
+    if not isinstance(modprops, list):
+        return out
+    for entry in modprops:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("Name")
+        if not isinstance(name, str):
+            continue
+        v = entry.get("NewValue")
+        if v in (None, ""):
+            v = entry.get("OldValue")
+        out[name] = str(v) if v not in (None, "") else None
+    return out
+
+
+def extract_consent_grants(
+    audit: dict,
+    *,
+    event_row_hash: str,
+    event_id: str | None,
+    ingest_run_id: int,
+    user_principal_name: str | None,
+    client_ip: str | None,
+    created_at_utc: str | None,
+    operation: str | None,
+) -> list[tuple]:
+    """One row per consent / service-principal grant.
+
+    Returns an empty list for events that aren't consent-shaped, so the
+    caller never needs to special-case.
+    """
+    if operation not in _CONSENT_OPERATIONS:
+        return []
+    target = audit.get("Target")
+    app_id, app_name = _parse_target_app(target)
+    if app_id is None and app_name is None:
+        # Fall back to top-level fields some sub-schemas use.
+        app_id = audit.get("ApplicationId") or audit.get("AppId")
+        app_name = audit.get("ApplicationDisplayName") or audit.get("ClientAppName")
+    if app_id is None and app_name is None:
+        # No identifiable app -- skip rather than write a useless row.
+        return []
+
+    mp = _parse_modified_properties(audit.get("ModifiedProperties"))
+    permissions = (
+        mp.get("ConsentAction.Permissions")
+        or mp.get("DelegationEntry.NewValue")
+        or mp.get("Included Updated Properties")
+    )
+    # Microsoft's ConsentAction.Permissions string looks like
+    # "[[Scope: Mail.Read]; [Scope: offline_access]]" -- normalize it.
+    if isinstance(permissions, str):
+        permissions = permissions.strip()
+    consent_type = mp.get("ConsentContext.IsAdminConsent")
+    is_admin = None
+    if isinstance(consent_type, str):
+        is_admin = 1 if consent_type.strip().lower() == "true" else 0
+    consent_type_str = mp.get("ConsentContext.OnBehalfOfAll")
+    if isinstance(consent_type_str, str):
+        consent_type_str = (
+            "AllPrincipals" if consent_type_str.strip().lower() == "true"
+            else "Principal"
+        )
+    if is_admin == 1:
+        consent_type_str = "AdminConsent"
+
+    granted_to_id = audit.get("UserId") or user_principal_name
+    granted_to_name = audit.get("UserDisplayName")
+
+    return [(
+        event_row_hash, event_id, ingest_run_id,
+        user_principal_name, client_ip, created_at_utc, operation,
+        app_id, app_name,
+        consent_type_str, is_admin, permissions,
+        granted_to_id, granted_to_name,
+    )]
+
+
+def row_hash(csv_row: dict, audit_canonical: str | None) -> str:
+    """Full-row SHA-256: every CSV column plus the canonical auditData."""
+    parts = [csv_row.get(k) or "" for k in EXPECTED_HEADER[:-1]]
+    parts.append(audit_canonical or csv_row.get("auditData") or "")
+    h = hashlib.sha256()
+    h.update("\x1f".join(parts).encode("utf-8", errors="replace"))
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# file helpers
+# ---------------------------------------------------------------------------
+
+_BATCH_SIZE = 500
+_PROGRESS_EVERY = 25_000
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def export_batch_for(path: Path, root: Path) -> str | None:
+    """Identify the Microsoft export-pull folder, e.g. '20260301-12345'."""
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return None
+    for part in rel.parts:
+        if re.fullmatch(r"\d{8}-\d{6}", part):
+            return part
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ingestion
+# ---------------------------------------------------------------------------
+
+def _make_event_tuple(
+    *,
+    csv_row: dict,
+    source_file: str,
+    source_line: int,
+    export_batch: str | None,
+    run_id: int,
+    ingested_at: str,
+) -> tuple[tuple, list[tuple], list[tuple], str | None]:
+    """Build the event row tuple plus its child-table rows.
+
+    Returns ``(event_values, mia_rows, consent_rows, parse_error)``.  Both
+    child-row lists are empty when the event is not of the relevant type.
+    """
+    parse_error: str | None = None
+
+    audit_raw = csv_row.get("auditData") or ""
+    audit_obj = None
+    audit_canon: str | None = None
+    if audit_raw:
+        try:
+            audit_obj = json.loads(audit_raw)
+            audit_canon = canonical_json(audit_obj)
+        except (json.JSONDecodeError, ValueError) as e:
+            parse_error = f"auditData JSON parse error: {e}"
+
+    audit_dict = audit_obj if isinstance(audit_obj, dict) else {}
+    promoted = extract_promoted(audit_dict, csv_row.get("clientIp"))
+
+    raw_dt = csv_row.get("createdDateTime") or ""
+    iso_dt: str | None = None
+    if isinstance(audit_obj, dict):
+        iso_dt = parse_created_dt(audit_obj.get("CreationTime") or "")
+    if iso_dt is None:
+        iso_dt = parse_created_dt(raw_dt)
+    if iso_dt is None and raw_dt:
+        msg = f"unparseable createdDateTime: {raw_dt!r}"
+        parse_error = f"{parse_error}; {msg}" if parse_error else msg
+
+    h = row_hash(csv_row, audit_canon)
+
+    upn_raw = csv_row.get("userPrincipalName") or None
+    upn_norm = _normalize_upn(upn_raw)
+
+    values = (
+        h, source_file, source_line, export_batch, ingested_at, run_id, parse_error,
+        csv_row.get("id"),
+        raw_dt or None, iso_dt,
+        csv_row.get("auditLogRecordType"),
+        csv_row.get("operation"),
+        csv_row.get("organizationId"),
+        csv_row.get("userType"),
+        csv_row.get("userId"),
+        csv_row.get("service"),
+        csv_row.get("objectId"),
+        upn_norm, upn_raw,
+        csv_row.get("clientIp") or None,
+        csv_row.get("administrativeUnits"),
+        audit_raw or None,
+        audit_canon,
+        promoted["workload"], promoted["client_ip"], promoted["client_ip_raw"],
+        promoted["user_agent"],
+        promoted["geo_location"], promoted["event_source"],
+        promoted["result_status"], promoted["result_status_detail"],
+        promoted["correlation_id"], promoted["application_id"], promoted["user_key"],
+        promoted["record_type_int"],
+        promoted["mailbox_owner_upn"], promoted["mailbox_guid"], promoted["logon_type"],
+        promoted["client_info_string"], promoted["internet_message_id"],
+        promoted["item_subject"], promoted["item_parent_folder_path"],
+        promoted["session_id"], promoted["logon_user_sid"],
+        promoted["authentication_type"], promoted["request_type"],
+        promoted["user_authentication_method"],
+        promoted["device_properties"], promoted["extended_properties"],
+        promoted["actor_ip_address"],
+        promoted["modified_properties"], promoted["parameters"],
+        promoted["operation_properties"],
+        promoted["actor_upn"], promoted["target_upn"],
+        promoted["site"], promoted["web_id"], promoted["list_id"],
+        promoted["list_item_unique_id"], promoted["source_file_name"],
+        promoted["source_relative_url"], promoted["item_type"],
+        promoted["client_app_id"], promoted["client_app_name"],
+        promoted["browser_name"], promoted["browser_version"],
+        promoted["platform"], promoted["is_managed_device"],
+        promoted["device_display_name"],
+        promoted["mail_item_count"],
+    )
+
+    op = csv_row.get("operation")
+    mia_rows = extract_mia_rows(
+        audit_dict,
+        event_row_hash=h, event_id=csv_row.get("id"), ingest_run_id=run_id,
+        user_principal_name=upn_norm,
+        client_ip=promoted["client_ip"],
+        created_at_utc=iso_dt,
+        operation=op,
+        mailbox_owner_upn=promoted["mailbox_owner_upn"],
+    )
+    consent_rows = extract_consent_grants(
+        audit_dict,
+        event_row_hash=h, event_id=csv_row.get("id"), ingest_run_id=run_id,
+        user_principal_name=upn_norm,
+        client_ip=promoted["client_ip"],
+        created_at_utc=iso_dt,
+        operation=op,
+    )
+
+    return values, mia_rows, consent_rows, parse_error
+
+
+def process_file(
+    conn: sqlite3.Connection,
+    csv_path: Path,
+    input_root: Path,
+    run_id: int,
+    ingested_at: str,
+) -> dict:
+    try:
+        rel = csv_path.relative_to(input_root).as_posix()
+    except ValueError:
+        rel = str(csv_path)
+
+    batch_id = export_batch_for(csv_path, input_root)
+    stat = csv_path.stat()
+    sha = file_sha256(csv_path)
+    mtime_iso = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(timespec="seconds")
+
+    cur = conn.execute(
+        "INSERT INTO ingest_files(run_id, source_file, export_batch, sha256, "
+        "size_bytes, mtime_utc, status) VALUES (?,?,?,?,?,?, 'started')",
+        (run_id, rel, batch_id, sha, stat.st_size, mtime_iso),
+    )
+    file_id = cur.lastrowid
+    conn.commit()
+
+    seen = inserted = duplicate = errors = 0
+    mia_emitted = consent_emitted = 0
+    row_buf: list[tuple] = []
+    mia_buf: list[tuple] = []
+    cg_buf: list[tuple] = []
+    err_buf: list[tuple] = []
+
+    def _flush_rows() -> None:
+        nonlocal inserted, duplicate
+        if not row_buf:
+            return
+        cur2 = conn.executemany(_INSERT_SQL, row_buf)
+        ins_now = cur2.rowcount if cur2.rowcount is not None and cur2.rowcount >= 0 else 0
+        inserted += ins_now
+        duplicate += len(row_buf) - ins_now
+        row_buf.clear()
+
+    def _flush_mia() -> None:
+        nonlocal mia_emitted
+        if not mia_buf:
+            return
+        cur2 = conn.executemany(_MIA_INSERT_SQL, mia_buf)
+        ins_now = cur2.rowcount if cur2.rowcount is not None and cur2.rowcount >= 0 else 0
+        mia_emitted += ins_now
+        mia_buf.clear()
+
+    def _flush_cg() -> None:
+        nonlocal consent_emitted
+        if not cg_buf:
+            return
+        cur2 = conn.executemany(_CG_INSERT_SQL, cg_buf)
+        ins_now = cur2.rowcount if cur2.rowcount is not None and cur2.rowcount >= 0 else 0
+        consent_emitted += ins_now
+        cg_buf.clear()
+
+    def _flush_errs() -> None:
+        if not err_buf:
+            return
+        conn.executemany(
+            "INSERT INTO parse_errors(run_id, source_file, source_line, "
+            "field, error_type, error_message, raw_excerpt) "
+            "VALUES (?,?,?,?,?,?,?)",
+            err_buf,
+        )
+        err_buf.clear()
+
+    info(f"  {dim('->')} {rel}  ({stat.st_size / 1_048_576:.1f} MiB)")
+
+    try:
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None or [c.strip() for c in reader.fieldnames] != EXPECTED_HEADER:
+                msg = f"unexpected header: {reader.fieldnames!r}"
+                conn.execute(
+                    "UPDATE ingest_files SET status='skipped', error_message=? "
+                    "WHERE file_id=?",
+                    (msg, file_id),
+                )
+                conn.commit()
+                warn(f"     skipped: {msg}")
+                return {
+                    "seen": 0, "inserted": 0, "duplicate": 0, "errors": 0,
+                    "mia_emitted": 0, "consent_emitted": 0,
+                    "skipped": True,
+                }
+
+            for line_no, raw_row in enumerate(reader, start=2):
+                seen += 1
+                try:
+                    values, mia_rows, cg_rows, perr = _make_event_tuple(
+                        csv_row=raw_row,
+                        source_file=rel,
+                        source_line=line_no,
+                        export_batch=batch_id,
+                        run_id=run_id,
+                        ingested_at=ingested_at,
+                    )
+                    row_buf.append(values)
+                    if mia_rows:
+                        mia_buf.extend(mia_rows)
+                    if cg_rows:
+                        cg_buf.extend(cg_rows)
+                    if perr:
+                        errors += 1
+                        err_buf.append((
+                            run_id, rel, line_no, "auditData",
+                            "ParseError", perr,
+                            (raw_row.get("auditData") or "")[:500],
+                        ))
+                except Exception as e:
+                    errors += 1
+                    err_buf.append((
+                        run_id, rel, line_no, None,
+                        type(e).__name__, str(e), None,
+                    ))
+
+                # FK ordering: events MUST be flushed before their child
+                # rows, because the child tables foreign-key into events.row_hash.
+                # When ANY buffer is full, flush events first, then children.
+                if (
+                    len(row_buf) >= _BATCH_SIZE
+                    or len(mia_buf) >= _BATCH_SIZE
+                    or len(cg_buf) >= _BATCH_SIZE
+                ):
+                    _flush_rows()
+                    _flush_mia()
+                    _flush_cg()
+                if len(err_buf) >= _BATCH_SIZE:
+                    _flush_errs()
+                if seen % _PROGRESS_EVERY == 0:
+                    info(
+                        f"     ... {seen:,} rows read "
+                        f"(inserted {inserted:,}, dup {duplicate:,}, err {errors:,})"
+                    )
+
+            _flush_rows()
+            _flush_mia()
+            _flush_cg()
+            _flush_errs()
+    except csv.Error as e:
+        _flush_rows()
+        _flush_mia()
+        _flush_cg()
+        _flush_errs()
+        conn.execute(
+            "UPDATE ingest_files SET status='failed', error_message=?, "
+            "rows_seen=?, rows_inserted=?, rows_duplicate=?, rows_with_errors=? "
+            "WHERE file_id=?",
+            (f"csv error: {e}", seen, inserted, duplicate, errors, file_id),
+        )
+        conn.commit()
+        err(f"     failed: {e}")
+        return {
+            "seen": seen, "inserted": inserted, "duplicate": duplicate,
+            "errors": errors, "mia_emitted": mia_emitted,
+            "consent_emitted": consent_emitted,
+            "skipped": False, "failed": True,
+        }
+
+    conn.execute(
+        "UPDATE ingest_files SET status='ok', rows_seen=?, rows_inserted=?, "
+        "rows_duplicate=?, rows_with_errors=? WHERE file_id=?",
+        (seen, inserted, duplicate, errors, file_id),
+    )
+    conn.commit()
+    extra = ""
+    if mia_emitted or consent_emitted:
+        bits = []
+        if mia_emitted:
+            bits.append(f"{mia_emitted:,} mail items")
+        if consent_emitted:
+            bits.append(f"{consent_emitted:,} consent grants")
+        extra = " + " + ", ".join(bits)
+    ok(
+        f"     done: {seen:,} rows  ({inserted:,} inserted, "
+        f"{duplicate:,} duplicate, {errors:,} with errors){extra}"
+    )
+    return {
+        "seen": seen, "inserted": inserted, "duplicate": duplicate,
+        "errors": errors, "mia_emitted": mia_emitted,
+        "consent_emitted": consent_emitted,
+        "skipped": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# coverage diagnostic
+# ---------------------------------------------------------------------------
+
+def compute_coverage(conn: sqlite3.Connection, run_id: int | None) -> dict:
+    """Compute the coverage report.
+
+    When ``run_id`` is given, statistics are scoped to events ingested in
+    that one run -- this is what the normal ingest path uses.  When
+    ``run_id`` is ``None``, statistics are computed over the full database
+    -- this is what ``--reextract`` uses, since it touches every existing
+    row but does not change ``ingest_run_id`` on those rows.
+
+    The intent is twofold: (1) tell the analyst at a glance how complete
+    the promotion is, and (2) make any silent regression after a future
+    schema / promoter change immediately visible (a coverage drop on
+    re-extract is evidence of a bug).
+    """
+    if run_id is None:
+        ev_pred = ""
+        ev_params: tuple = ()
+        child_pred = ""
+        child_params: tuple = ()
+    else:
+        ev_pred = " WHERE ingest_run_id = ?"
+        ev_params = (run_id,)
+        child_pred = " WHERE ingest_run_id = ?"
+        child_params = (run_id,)
+
+    def _q1(sql: str, params: tuple = ()) -> int:
+        row = conn.execute(sql, params).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    total = _q1(f"SELECT COUNT(*) FROM events{ev_pred}", ev_params)
+    if total == 0:
+        return {
+            "run_id": run_id, "events_total": 0,
+            "client_ip_pct": None, "user_agent_pct": None,
+            "application_id_pct": None, "user_principal_name_pct": None,
+            "mia_events": 0, "mia_rows": 0, "mia_avg_items": None,
+            "consent_events": 0, "consent_rows": 0,
+        }
+
+    def _pct(populated: int) -> float:
+        return round(100.0 * populated / total, 2)
+
+    def _populated(col: str) -> int:
+        if ev_pred:
+            sql = (
+                f"SELECT COUNT(*) FROM events{ev_pred} "
+                f"  AND {col} IS NOT NULL AND {col} <> ''"
+            )
+        else:
+            sql = (
+                f"SELECT COUNT(*) FROM events "
+                f"WHERE {col} IS NOT NULL AND {col} <> ''"
+            )
+        return _q1(sql, ev_params)
+
+    cov = {
+        "run_id": run_id,
+        "events_total": total,
+        "client_ip_pct":             _pct(_populated("client_ip")),
+        "user_agent_pct":            _pct(_populated("user_agent")),
+        "application_id_pct":        _pct(_populated("application_id")),
+        "user_principal_name_pct":   _pct(_populated("user_principal_name")),
+    }
+
+    if ev_pred:
+        mia_events_sql = (
+            f"SELECT COUNT(*) FROM events{ev_pred} AND record_type_int = 50"
+        )
+    else:
+        mia_events_sql = (
+            "SELECT COUNT(*) FROM events WHERE record_type_int = 50"
+        )
+    mia_events = _q1(mia_events_sql, ev_params)
+    mia_rows = _q1(f"SELECT COUNT(*) FROM mail_items_accessed{child_pred}",
+                   child_params)
+    cov["mia_events"] = mia_events
+    cov["mia_rows"] = mia_rows
+    cov["mia_avg_items"] = (
+        round(mia_rows / mia_events, 2) if mia_events else None
+    )
+
+    consent_op_in = (
+        "operation IN ('Consent to application.','Add OAuth2PermissionGrant.',"
+        "'Add delegated permission grant.','Add app role assignment grant to user.',"
+        "'Add app role assignment to service principal.',"
+        "'Add service principal.','Add service principal credentials.')"
+    )
+    if ev_pred:
+        consent_evt_sql = (
+            f"SELECT COUNT(*) FROM events{ev_pred} AND {consent_op_in}"
+        )
+    else:
+        consent_evt_sql = f"SELECT COUNT(*) FROM events WHERE {consent_op_in}"
+    consent_events = _q1(consent_evt_sql, ev_params)
+    consent_rows = _q1(f"SELECT COUNT(*) FROM consent_grants{child_pred}",
+                       child_params)
+    cov["consent_events"] = consent_events
+    cov["consent_rows"] = consent_rows
+    return cov
+
+
+def _emit_coverage(cov: dict) -> None:
+    if cov["events_total"] == 0:
+        warn("  (no events were inserted in this run; skipping coverage report)")
+        return
+    blank()
+    header("Coverage report")
+    info(f"  Events ingested:           {cov['events_total']:,}")
+    info(f"  client_ip populated:       {cov['client_ip_pct']:>6.2f}%")
+    info(f"  user_agent populated:      {cov['user_agent_pct']:>6.2f}%")
+    info(f"  application_id populated:  {cov['application_id_pct']:>6.2f}%")
+    info(f"  user_principal_name pop'd: {cov['user_principal_name_pct']:>6.2f}%")
+    if cov["mia_events"]:
+        info(
+            f"  MailItemsAccessed events:  {cov['mia_events']:,} "
+            f"-> {cov['mia_rows']:,} per-message rows "
+            f"(avg {cov['mia_avg_items']} items/event)"
+        )
+    if cov["consent_events"]:
+        info(
+            f"  Consent / SP-grant events: {cov['consent_events']:,} "
+            f"-> {cov['consent_rows']:,} consent_grants rows"
+        )
+
+
+# ---------------------------------------------------------------------------
+# summary
+# ---------------------------------------------------------------------------
+
+def _emit_summary(
+    *,
+    files_count: int,
+    totals: dict,
+    db_path: Path,
+    run_end: datetime,
+) -> None:
+    blank()
+    header("Summary")
+    elapsed = _format_duration(run_end - _RUN_START)
+    info(f"  Database:        {db_path}")
+    info(f"  Files processed: {files_count:,}")
+    info(f"  Rows seen:       {totals['seen']:,}")
+    ok  (f"  Rows inserted:   {totals['inserted']:,}")
+    if totals["duplicate"]:
+        warn(f"  Rows duplicate:  {totals['duplicate']:,}")
+    else:
+        info("  Rows duplicate:  0")
+    if totals["errors"]:
+        warn(f"  Rows w/ errors:  {totals['errors']:,}")
+    else:
+        info("  Rows w/ errors:  0")
+    if totals.get("mia_emitted"):
+        info(f"  Mail items:      {totals['mia_emitted']:,} (per-message rows)")
+    if totals.get("consent_emitted"):
+        info(f"  Consent grants:  {totals['consent_emitted']:,} (per-app rows)")
+    info(f"  Started:         {_TS_DISPLAY}")
+    info(f"  Ended:           {run_end.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    info(f"  Elapsed:         {elapsed}")
+
+
+# ---------------------------------------------------------------------------
+# --reextract: rebuild promoted columns + child tables in place
+# ---------------------------------------------------------------------------
+
+_REEXTRACT_BATCH = 5000
+
+
+# Names of indexes that we drop (and re-create) around the reextract.
+# These exist on tables that get heavy bulk INSERT activity; keeping
+# the indexes live during the bulk load makes inserts O(N log N) instead
+# of O(N), which on a 9 GB / 1M-row database is the difference between
+# minutes and hours.  The CREATE statements live in _INDEX_DDL so
+# init_schema rebuilds them after we're done.
+_REEXTRACT_DROP_INDEXES: tuple[str, ...] = (
+    "idx_mia_event_row", "idx_mia_upn", "idx_mia_imid",
+    "idx_mia_subj", "idx_mia_created",
+    "idx_cg_event_row", "idx_cg_upn", "idx_cg_app", "idx_cg_created",
+    # NB: the uq_mia_event_item and uq_cg_event_app UNIQUE indexes are
+    # intentionally NOT dropped -- they are the dedup mechanism that lets
+    # INSERT OR IGNORE collapse near-duplicates emitted by Microsoft when
+    # the same message appears in multiple folders or the same event row
+    # is paged across export files.  Dropping them would let duplicate
+    # rows accumulate that we couldn't even rebuild the index over.
+)
+
+
+def reextract_db(db_path: Path, *, log_path: Path | None = None) -> int:
+    """Walk every event row, re-run the promoter, rebuild child tables.
+
+    Used to upgrade a database whose ``user_version`` is older than the
+    current ``SCHEMA_VERSION`` without having to re-read source CSVs --
+    the canonical auditData JSON is always preserved in
+    ``events.audit_data_canonical``.
+
+    Implementation notes (the things that make this fast on a 9 GB / 1M-row
+    database):
+
+    - Two connections: ``conn_r`` reads, ``conn_w`` writes.  In WAL mode
+      readers and writers don't block each other, but interleaving them on
+      the same connection causes page-cache thrash and prematurely
+      materialises the read cursor.
+    - Read cursor uses ``fetchmany(_REEXTRACT_BATCH)`` so we never hold a
+      whole-table result-set in memory and never round-trip per row.
+    - Writes happen inside one ``BEGIN IMMEDIATE ... COMMIT`` so SQLite
+      only fsyncs at the end (acceptable: if we crash, the transaction
+      rolls back atomically, the v1 data is unchanged, and the analyst
+      simply re-runs --reextract).
+    - Child-table indexes are dropped before the bulk insert and rebuilt
+      at the end via ``init_schema`` -- O(N) inserts beat O(N log N) on a
+      million rows by orders of magnitude.
+    """
+    if not db_path.exists():
+        err(f"{_SCRIPT_NAME}: --reextract target does not exist: {db_path}")
+        return 2
+
+    conn_w = open_db(db_path)
+    conn_r = sqlite3.connect(db_path)  # plain read connection, no PRAGMAs needed
+    try:
+        # ---- version check + structural migration --------------------------
+        cur_ver = conn_w.execute("PRAGMA user_version").fetchone()[0]
+        if cur_ver == SCHEMA_VERSION:
+            info(f"  Database already at schema_version={SCHEMA_VERSION}; "
+                 "re-extracting will refresh promoted columns + child tables.")
+        elif cur_ver == 1:
+            info(f"  Upgrading database from schema_version=1 to {SCHEMA_VERSION}.")
+            _migrate_events_v1_to_v2(conn_w)
+        else:
+            err(
+                f"{_SCRIPT_NAME}: --reextract cannot handle "
+                f"user_version={cur_ver}; this {APP_NAME} only knows how to "
+                f"upgrade from v1 -> v{SCHEMA_VERSION}."
+            )
+            return 2
+
+        # init_schema creates missing tables and indexes (idempotent).
+        init_schema(conn_w)
+
+        ingested_at = datetime.now(UTC).isoformat(timespec="seconds")
+        cur = conn_w.execute(
+            "INSERT INTO ingest_runs(started_at, app_version, argv, mode, "
+            "input_dir, status) VALUES (?,?,?, 'reextract', ?, 'running')",
+            (ingested_at, VERSION, " ".join(sys.argv), str(db_path)),
+        )
+        run_id = cur.lastrowid
+        conn_w.commit()
+
+        total = conn_r.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        info(f"  Re-promoting {total:,} event(s)...")
+
+        # ---- bulk-mode PRAGMAs --------------------------------------------
+        # synchronous=OFF is safe inside the wrapping BEGIN IMMEDIATE: a crash
+        # rolls back the entire transaction.  We restore NORMAL at the end.
+        conn_w.execute("PRAGMA synchronous = OFF")
+
+        # ---- drop child-table indexes for the duration of the load --------
+        for ix in _REEXTRACT_DROP_INDEXES:
+            conn_w.execute(f"DROP INDEX IF EXISTS {ix}")
+
+        update_cols = [c for c in _EVENT_COLUMNS if c not in {
+            "row_hash", "source_file", "source_line", "export_batch",
+            "ingested_at", "ingest_run_id", "parse_error",
+            "audit_data_raw", "audit_data_canonical",
+            # CSV-derived fields: keep as-is from original ingest.
+            "id", "created_at_raw", "audit_log_record_type",
+            "operation", "organization_id", "user_type", "user_id", "service",
+            "object_id", "client_ip_csv", "administrative_units",
+        }]
+        update_sql = (
+            "UPDATE events SET " + ", ".join(f"{c}=?" for c in update_cols)
+            + " WHERE row_hash=?"
+        )
+
+        # ---- one giant transaction ----------------------------------------
+        conn_w.execute("BEGIN IMMEDIATE")
+        try:
+            # Wipe child rows so we can repopulate idempotently (now that indexes
+            # are gone, this is fast even on a huge table).
+            conn_w.execute("DELETE FROM mail_items_accessed")
+            conn_w.execute("DELETE FROM consent_grants")
+
+            scanned = updated = mia_added = cg_added = 0
+
+            cur_r = conn_r.execute(
+                "SELECT row_hash, id, created_at_raw, operation, "
+                "client_ip_csv, audit_data_canonical FROM events"
+            )
+
+            while True:
+                rows = cur_r.fetchmany(_REEXTRACT_BATCH)
+                if not rows:
+                    break
+                upd_buf: list[tuple] = []
+                mia_buf: list[tuple] = []
+                cg_buf: list[tuple] = []
+                for row in rows:
+                    scanned += 1
+                    (rh, ev_id, raw_dt, op, csv_ip, audit_canon) = row
+                    audit_obj = None
+                    if audit_canon:
+                        try:
+                            audit_obj = json.loads(audit_canon)
+                        except (json.JSONDecodeError, ValueError):
+                            audit_obj = None
+                    audit_dict = audit_obj if isinstance(audit_obj, dict) else {}
+                    promoted = extract_promoted(audit_dict, csv_ip)
+
+                    iso_dt: str | None = None
+                    if isinstance(audit_obj, dict):
+                        iso_dt = parse_created_dt(audit_obj.get("CreationTime") or "")
+                    if iso_dt is None and raw_dt:
+                        iso_dt = parse_created_dt(raw_dt)
+
+                    upn_norm = _normalize_upn(audit_dict.get("UserId"))
+                    upn_raw = audit_dict.get("UserId")
+
+                    # values aligned with update_cols (do not realign without
+                    # also updating update_cols above)
+                    vals = [
+                        iso_dt,                                # created_at_utc
+                        upn_norm,                              # user_principal_name
+                        upn_raw,                               # user_principal_name_raw
+                        promoted["workload"],
+                        promoted["client_ip"],
+                        promoted["client_ip_raw"],
+                        promoted["user_agent"],
+                        promoted["geo_location"],
+                        promoted["event_source"],
+                        promoted["result_status"],
+                        promoted["result_status_detail"],
+                        promoted["correlation_id"],
+                        promoted["application_id"],
+                        promoted["user_key"],
+                        promoted["record_type_int"],
+                        promoted["mailbox_owner_upn"],
+                        promoted["mailbox_guid"],
+                        promoted["logon_type"],
+                        promoted["client_info_string"],
+                        promoted["internet_message_id"],
+                        promoted["item_subject"],
+                        promoted["item_parent_folder_path"],
+                        promoted["session_id"],
+                        promoted["logon_user_sid"],
+                        promoted["authentication_type"],
+                        promoted["request_type"],
+                        promoted["user_authentication_method"],
+                        promoted["device_properties"],
+                        promoted["extended_properties"],
+                        promoted["actor_ip_address"],
+                        promoted["modified_properties"],
+                        promoted["parameters"],
+                        promoted["operation_properties"],
+                        promoted["actor_upn"],
+                        promoted["target_upn"],
+                        promoted["site"],
+                        promoted["web_id"],
+                        promoted["list_id"],
+                        promoted["list_item_unique_id"],
+                        promoted["source_file_name"],
+                        promoted["source_relative_url"],
+                        promoted["item_type"],
+                        promoted["client_app_id"],
+                        promoted["client_app_name"],
+                        promoted["browser_name"],
+                        promoted["browser_version"],
+                        promoted["platform"],
+                        promoted["is_managed_device"],
+                        promoted["device_display_name"],
+                        promoted["mail_item_count"],
+                    ]
+                    # Sanity-guard: vals must align 1:1 with update_cols.
+                    # If you add a column to update_cols above, you must add
+                    # its value here in the same position.
+                    assert len(vals) == len(update_cols), (
+                        f"reextract values/columns drift: "
+                        f"{len(vals)} vs {len(update_cols)}"
+                    )
+                    upd_buf.append(tuple(vals) + (rh,))
+
+                    mia_buf.extend(extract_mia_rows(
+                        audit_dict,
+                        event_row_hash=rh, event_id=ev_id, ingest_run_id=run_id,
+                        user_principal_name=upn_norm,
+                        client_ip=promoted["client_ip"],
+                        created_at_utc=iso_dt,
+                        operation=op,
+                        mailbox_owner_upn=promoted["mailbox_owner_upn"],
+                    ))
+                    cg_buf.extend(extract_consent_grants(
+                        audit_dict,
+                        event_row_hash=rh, event_id=ev_id, ingest_run_id=run_id,
+                        user_principal_name=upn_norm,
+                        client_ip=promoted["client_ip"],
+                        created_at_utc=iso_dt,
+                        operation=op,
+                    ))
+
+                if upd_buf:
+                    conn_w.executemany(update_sql, upd_buf)
+                    updated += len(upd_buf)
+                if mia_buf:
+                    cur2 = conn_w.executemany(_MIA_INSERT_SQL, mia_buf)
+                    mia_added += cur2.rowcount if cur2.rowcount and cur2.rowcount >= 0 else 0
+                if cg_buf:
+                    cur2 = conn_w.executemany(_CG_INSERT_SQL, cg_buf)
+                    cg_added += cur2.rowcount if cur2.rowcount and cur2.rowcount >= 0 else 0
+
+                # progress every batch
+                if scanned % 50_000 < _REEXTRACT_BATCH:
+                    info(
+                        f"     ... {scanned:,} of {total:,} re-promoted "
+                        f"(mia {mia_added:,}, consent {cg_added:,})"
+                    )
+
+            conn_w.execute("COMMIT")
+        except Exception:
+            conn_w.execute("ROLLBACK")
+            raise
+        finally:
+            conn_w.execute("PRAGMA synchronous = NORMAL")
+
+        # ---- rebuild dropped indexes --------------------------------------
+        info("  Rebuilding child-table indexes...")
+        for ddl in _INDEX_DDL:
+            conn_w.execute(ddl)
+        conn_w.commit()
+
+        end = datetime.now(UTC)
+        # In reextract mode coverage is DB-wide (no run_id filter): the run
+        # we just executed touches every existing event but does NOT change
+        # their original ingest_run_id, so a per-run filter would always
+        # report 0 rows.  The whole-database view is what the analyst (and
+        # bec-triage's banner) actually want anyway.
+        cov = compute_coverage(conn_w, None)
+        conn_w.execute(
+            "UPDATE ingest_runs SET ended_at=?, files_processed=0, "
+            "rows_seen=?, rows_inserted=?, rows_duplicate=0, "
+            "rows_with_errors=0, mia_rows_emitted=?, "
+            "consent_rows_emitted=?, coverage_json=?, status='ok' "
+            "WHERE run_id=?",
+            (
+                end.isoformat(timespec="seconds"),
+                scanned, updated, mia_added, cg_added,
+                canonical_json(cov),
+                run_id,
+            ),
+        )
+        conn_w.commit()
+
+        elapsed = _format_duration(end - _RUN_START)
+        ok(f"  Re-extract complete in {elapsed}: {scanned:,} events scanned, "
+           f"{updated:,} updated, "
+           f"{mia_added:,} mail-item rows, {cg_added:,} consent rows.")
+        _emit_coverage(cov)
+        return 0
+    finally:
+        try:
+            conn_w.execute("PRAGMA optimize")
+        except sqlite3.Error:
+            pass
+        conn_w.close()
+        conn_r.close()
+
+
+def _migrate_events_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Add v2-only columns to a v1 ``events`` table.  ``init_schema`` will
+    add the new tables and indexes; this only handles ``ALTER TABLE`` for
+    columns that ``CREATE TABLE IF NOT EXISTS`` won't add to an existing
+    table.
+    """
+    cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()
+    }
+    new_cols = [
+        ("user_principal_name_raw", "TEXT"),
+        ("client_ip_raw", "TEXT"),
+        ("result_status_detail", "TEXT"),
+        ("request_type", "TEXT"),
+        ("user_authentication_method", "TEXT"),
+        ("extended_properties", "TEXT"),
+        ("mail_item_count", "INTEGER"),
+    ]
+    for name, ctype in new_cols:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {name} {ctype}")
+    # ingest_runs additions:
+    irc = {r[1] for r in conn.execute("PRAGMA table_info(ingest_runs)").fetchall()}
+    for name, ctype in [
+        ("mode", "TEXT"),
+        ("mia_rows_emitted", "INTEGER DEFAULT 0"),
+        ("consent_rows_emitted", "INTEGER DEFAULT 0"),
+        ("coverage_json", "TEXT"),
+    ]:
+        if name not in irc:
+            conn.execute(f"ALTER TABLE ingest_runs ADD COLUMN {name} {ctype}")
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+
+    # auditData blobs can be very large; raise the csv module's per-field cap.
+    csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
+
+    # --reextract takes its own short path (no INPUT_DIR, no CSV reading).
+    if args.reextract:
+        if args.input_dir:
+            err(
+                f"{_SCRIPT_NAME}: --reextract takes a database path as its "
+                "value, not an input directory; remove the trailing "
+                f"INPUT_DIR argument ({args.input_dir!r})."
+            )
+            return 2
+        db_path = Path(args.reextract).resolve()
+        if args.log:
+            log_path = _resolve_log_path(db_path.parent)
+            try:
+                _LOG.open(log_path)
+            except OSError as e:
+                err(f"{_SCRIPT_NAME}: could not open log file {log_path}: {e}")
+                return 2
+        header(f"{_SCRIPT_NAME} {VERSION}  --  re-extract mode")
+        info(f"Started:   {_TS_DISPLAY}")
+        if _LOG.path is not None:
+            info(f"Log file:  {_LOG.path}")
+        info(f"Database:  {db_path}")
+        blank()
+        return reextract_db(db_path, log_path=_LOG.path)
+
+    if not args.input_dir:
+        err(
+            f"{_SCRIPT_NAME}: INPUT_DIR is required when using -o / -a "
+            "(only --reextract may omit it)."
+        )
+        return 2
+    input_dir = Path(args.input_dir).resolve()
+    if not input_dir.exists():
+        err(f"{_SCRIPT_NAME}: input directory does not exist: {input_dir}")
+        return 2
+    if not input_dir.is_dir():
+        err(f"{_SCRIPT_NAME}: input path is not a directory: {input_dir}")
+        return 2
+
+    if args.append:
+        db_path = Path(args.append).resolve()
+        ok_v, reason = verify_ualforge_db(db_path)
+        if not ok_v:
+            err(f"{_SCRIPT_NAME}: --append target is not a ualforge database: {reason}")
+            return 2
+        out_dir = db_path.parent
+        mode = "append (explicit)"
+    else:
+        out_dir = Path(args.output).resolve()
+        if out_dir.exists() and not out_dir.is_dir():
+            err(f"{_SCRIPT_NAME}: --output path exists but is not a directory: {out_dir}")
+            return 2
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            err(f"{_SCRIPT_NAME}: could not create output directory {out_dir}: {e}")
+            return 2
+        db_path = out_dir / f"{APP_NAME}-{_TS_DATE}.sqlite"
+        if db_path.exists():
+            ok_v, reason = verify_ualforge_db(db_path)
+            if not ok_v:
+                err(
+                    f"{_SCRIPT_NAME}: existing file {db_path} is not a "
+                    f"ualforge database: {reason}"
+                )
+                return 2
+            mode = "append (same-day)"
+        else:
+            mode = "create"
+
+    if args.log:
+        log_path = _resolve_log_path(out_dir)
+        try:
+            _LOG.open(log_path)
+        except OSError as e:
+            err(f"{_SCRIPT_NAME}: could not open log file {log_path}: {e}")
+            return 2
+
+    header(f"{_SCRIPT_NAME} {VERSION}")
+    info(f"Started:   {_TS_DISPLAY}")
+    if _LOG.path is not None:
+        info(f"Log file:  {_LOG.path}")
+    info(f"Database:  {db_path}  [{mode}]")
+    info(f"Scanning:  {input_dir}")
+    blank()
+
+    csvs, rejected = find_ual_csvs(input_dir)
+    if not csvs:
+        warn(f"No UAL CSV files found under {input_dir}. Nothing to do.")
+        if rejected:
+            warn(f"({len(rejected)} candidate file(s) rejected by structural check.)")
+        return 0
+    info(f"Found {len(csvs)} UAL CSV file(s).")
+    if rejected:
+        warn(f"  ({len(rejected)} other CSV(s) rejected by header check.)")
+
+    conn = open_db(db_path)
+    try:
+        init_schema(conn)
+        ingested_at = datetime.now(UTC).isoformat(timespec="seconds")
+        cur = conn.execute(
+            "INSERT INTO ingest_runs(started_at, app_version, argv, mode, "
+            "input_dir, status) VALUES (?,?,?,?,?, 'running')",
+            (ingested_at, VERSION, " ".join(sys.argv), mode, str(input_dir)),
+        )
+        run_id = cur.lastrowid
+        conn.commit()
+
+        totals = {
+            "seen": 0, "inserted": 0, "duplicate": 0, "errors": 0,
+            "mia_emitted": 0, "consent_emitted": 0,
+        }
+        files_processed = 0
+        for i, csv_path in enumerate(csvs, 1):
+            blank()
+            header(f"[{i}/{len(csvs)}] {csv_path.name}")
+            stats = process_file(conn, csv_path, input_dir, run_id, ingested_at)
+            files_processed += 1
+            for k in totals:
+                totals[k] += stats.get(k, 0)
+
+        end = datetime.now(UTC)
+        cov = compute_coverage(conn, run_id)
+        conn.execute(
+            "UPDATE ingest_runs SET ended_at=?, files_processed=?, "
+            "rows_seen=?, rows_inserted=?, rows_duplicate=?, "
+            "rows_with_errors=?, mia_rows_emitted=?, consent_rows_emitted=?, "
+            "coverage_json=?, status='ok' WHERE run_id=?",
+            (
+                end.isoformat(timespec="seconds"),
+                files_processed,
+                totals["seen"],
+                totals["inserted"],
+                totals["duplicate"],
+                totals["errors"],
+                totals["mia_emitted"],
+                totals["consent_emitted"],
+                canonical_json(cov),
+                run_id,
+            ),
+        )
+        conn.commit()
+        _emit_summary(
+            files_count=files_processed,
+            totals=totals,
+            db_path=db_path,
+            run_end=end,
+        )
+        _emit_coverage(cov)
+
+        if rejected:
+            blank()
+            header("Rejected files")
+            for p, reason in rejected:
+                try:
+                    rel = p.relative_to(input_dir).as_posix()
+                except ValueError:
+                    rel = str(p)
+                warn(f"  {rel}: {reason}")
+        return 0
+    finally:
+        try:
+            conn.execute("PRAGMA optimize")
+        except sqlite3.Error:
+            pass
+        conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

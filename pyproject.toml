@@ -1,0 +1,7 @@
+[project]
+name = "ualforge"
+version = "2026.05.01"
+description = "Parse Microsoft UAL files to sqlite"
+requires-python = ">=3.13"
+dependencies = [
+]
